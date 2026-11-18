@@ -5,10 +5,17 @@
 
 use eframe::egui;
 use enigo::{Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[derive(PartialEq, Eq)]
+enum InputMode {
+    Text,
+    FileBrowser,
+}
 
 struct Shared {
     status: String,
@@ -18,6 +25,9 @@ struct Shared {
 
 struct VmTyper {
     text: String,
+    input_mode: InputMode,
+    current_dir: PathBuf,
+    selected_file: Option<PathBuf>,
     delay_s: u64,
     key_ms: u64,
     clean: bool,
@@ -139,15 +149,19 @@ fn run(
 
 impl VmTyper {
     fn new() -> Self {
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             text: String::new(),
+            input_mode: InputMode::Text,
+            current_dir,
+            selected_file: None,
             delay_s: 5,
             key_ms: 40,
             clean: true,
             strip_indent: false,
             final_enter: false,
             shared: Arc::new(Mutex::new(Shared {
-                status: "Paste or type your text, then press Start.".into(),
+                status: "Paste or select text/file, then press Start.".into(),
                 progress: 0.0,
                 running: false,
             })),
@@ -205,29 +219,142 @@ impl eframe::App for VmTyper {
         };
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Text to type");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{} characters", self.text.chars().count()));
-                });
-            });
+            // Mode-dependent top section
+            match self.input_mode {
+                InputMode::Text => {
+                    ui.horizontal(|ui| {
+                        ui.label("Text to type");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(format!("{} characters", self.text.chars().count()));
+                        });
+                    });
 
-            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                ui.add_enabled(
-                    !running,
-                    egui::TextEdit::multiline(&mut self.text)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(12),
-                );
-            });
-
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!running, egui::Button::new("Paste clipboard")).clicked() {
-                    self.paste_clipboard();
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        ui.add_enabled(
+                            !running,
+                            egui::TextEdit::multiline(&mut self.text)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(12),
+                        );
+                    });
                 }
-                if ui.add_enabled(!running, egui::Button::new("Clear")).clicked() {
-                    self.text.clear();
-                    set(&self.shared, |s| s.progress = 0.0);
+                InputMode::FileBrowser => {
+                    ui.horizontal(|ui| {
+                        ui.label("File Tree & Selector");
+                        if let Some(ref file) = self.selected_file {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                                ui.label(format!("Selected: {name} ({} chars)", self.text.chars().count()));
+                            });
+                        }
+                    });
+
+                    // Directory navigation bar
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!running, egui::Button::new("📁 Up")).clicked() {
+                            if let Some(parent) = self.current_dir.parent() {
+                                self.current_dir = parent.to_path_buf();
+                            }
+                        }
+                        ui.label(format!("Path: {}", self.current_dir.display()));
+                    });
+
+                    // Scrollable file tree view
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
+                            let mut dirs = vec![];
+                            let mut files = vec![];
+                            for entry in entries.flatten() {
+                                if let Ok(meta) = entry.metadata() {
+                                    let path = entry.path();
+                                    if meta.is_dir() {
+                                        dirs.push(path);
+                                    } else if meta.is_file() {
+                                        let ext = path.extension()
+                                            .and_then(|e| e.to_str())
+                                            .unwrap_or("")
+                                            .to_lowercase();
+                                        let skip_exts =["exe", "dll", "bin", "png", "jpg", "jpeg", "ico", "zip", "tar", "gz", "pdf", "mp3", "mp4", "db"];
+                                        if skip_exts.contains(&ext.as_str()){
+                                            continue;
+                                        }
+                                        if let Ok(content) = std::fs::read_to_string(&path){
+                                            if !content.chars().any(|c| c == '\0'){
+                                                files.push(path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            dirs.sort();
+                            files.sort();
+
+                            for dir in dirs {
+                                if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                                    if ui.selectable_label(false, format!("📁 {name}")).clicked() {
+                                        self.current_dir = dir;
+                                    }
+                                }
+                            }
+                            for file in files {
+                                if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+                                    let is_selected = self.selected_file.as_ref() == Some(&file);
+                                    if ui.selectable_label(is_selected, format!("📄 {name}")).clicked() {
+                                        self.selected_file = Some(file.clone());
+                                        match std::fs::read_to_string(&file) {
+                                            Ok(content) => {
+                                                self.text = content;
+                                                set(&self.shared, |s| {
+                                                    s.status = format!("Loaded file: {name}");
+                                                });
+                                            }
+                                            Err(e) => {
+                                                set(&self.shared, |s| {
+                                                    s.status = format!("Error reading file: {e}");
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.label("Unable to read directory contents.");
+                        }
+                    });
+                }
+            }
+
+            // Controls below text/file area
+            ui.horizontal(|ui| {
+                match self.input_mode {
+                    InputMode::Text => {
+                        if ui.add_enabled(!running, egui::Button::new("Paste clipboard")).clicked() {
+                            self.paste_clipboard();
+                        }
+                        if ui.add_enabled(!running, egui::Button::new("Clear")).clicked() {
+                            self.text.clear();
+                            set(&self.shared, |s| s.progress = 0.0);
+                        }
+                    }
+                    InputMode::FileBrowser => {
+                        if ui.add_enabled(!running, egui::Button::new("Clear File Selection")).clicked() {
+                            self.text.clear();
+                            self.selected_file = None;
+                            set(&self.shared, |s| s.progress = 0.0);
+                        }
+                    }
+                }
+
+                // Mode toggle button
+                let mode_label = match self.input_mode {
+                    InputMode::Text => "Mode: Text / Clipboard",
+                    InputMode::FileBrowser => "Mode: File Tree",
+                };
+                if ui.add_enabled(!running, egui::Button::new(mode_label)).clicked() {
+                    self.input_mode = match self.input_mode {
+                        InputMode::Text => InputMode::FileBrowser,
+                        InputMode::FileBrowser => InputMode::Text,
+                    };
                 }
             });
 
