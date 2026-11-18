@@ -14,8 +14,16 @@ use std::time::Duration;
 #[derive(PartialEq, Eq)]
 enum InputMode {
     Text,
-    FileBrowser,
+    File,
 }
+
+// How much of a dropped file to show as a preview, so a huge file
+// doesn't get rendered into the UI in full.
+const PREVIEW_CHARS: usize = 600;
+
+// Window sizes for the normal and compact layouts.
+const NORMAL_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 620.0);
+const COMPACT_SIZE: egui::Vec2 = egui::Vec2::new(230.0, 95.0);
 
 struct Shared {
     status: String,
@@ -26,13 +34,22 @@ struct Shared {
 struct VmTyper {
     text: String,
     input_mode: InputMode,
-    current_dir: PathBuf,
-    selected_file: Option<PathBuf>,
+    dropped_file: Option<PathBuf>,
+    preview: String,
+
+    // --- Settings -------------------------------------------------------
+    // Add new settings fields here as you add more toggles below.
     delay_s: u64,
     key_ms: u64,
     clean: bool,
     strip_indent: bool,
     final_enter: bool,
+    always_on_top: bool,
+
+    // Whether the window is shrunk to just Start/Stop/Return + progress,
+    // so the full editor doesn't sit on top of the VM window.
+    compact_mode: bool,
+
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
 }
@@ -59,6 +76,15 @@ fn in_corner(enigo: &Enigo) -> bool {
     match (enigo.main_display(), enigo.location()) {
         (Ok((w, h)), Ok((x, y))) => (x <= 0 || x >= w - 1) && (y <= 0 || y >= h - 1),
         _ => false,
+    }
+}
+
+fn make_preview(text: &str) -> String {
+    if text.chars().count() <= PREVIEW_CHARS {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(PREVIEW_CHARS).collect();
+        format!("{truncated}\n\n… (preview truncated, full text will still be typed)")
     }
 }
 
@@ -149,19 +175,20 @@ fn run(
 
 impl VmTyper {
     fn new() -> Self {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             text: String::new(),
             input_mode: InputMode::Text,
-            current_dir,
-            selected_file: None,
+            dropped_file: None,
+            preview: String::new(),
             delay_s: 5,
             key_ms: 40,
             clean: true,
             strip_indent: false,
             final_enter: false,
+            always_on_top: true,
+            compact_mode: false,
             shared: Arc::new(Mutex::new(Shared {
-                status: "Paste or select text/file, then press Start.".into(),
+                status: "Paste text, or switch to File mode and drop a file in.".into(),
                 progress: 0.0,
                 running: false,
             })),
@@ -173,6 +200,32 @@ impl VmTyper {
         if let Ok(t) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             self.text = t;
         }
+    }
+
+    // Reads a dropped file's contents into self.text and builds the preview.
+    fn load_file(&mut self, path: PathBuf) {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                self.preview = make_preview(&content);
+                self.text = content;
+                self.dropped_file = Some(path);
+                set(&self.shared, |s| s.status = format!("Loaded file: {name}"));
+            }
+            Err(e) => {
+                set(&self.shared, |s| s.status = format!("Could not read file: {e}"));
+            }
+        }
+    }
+
+    fn clear_file(&mut self) {
+        self.text.clear();
+        self.preview.clear();
+        self.dropped_file = None;
+        set(&self.shared, |s| s.progress = 0.0);
     }
 
     fn prepare(&self) -> String {
@@ -209,6 +262,28 @@ impl VmTyper {
         );
         thread::spawn(move || run(text, delay, interval, fin, shared, stop, ctx));
     }
+
+    // Shrinks or restores the window and flips compact_mode.
+    fn set_compact(&mut self, ctx: &egui::Context, compact: bool) {
+        self.compact_mode = compact;
+        let size = if compact { COMPACT_SIZE } else { NORMAL_SIZE };
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        // Compact mode has a fixed small size; let the normal layout be
+        // resized freely again once we return to it.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!compact));
+    }
+
+    // Applies the always-on-top setting to the actual OS window.
+    // Called once per frame; sending the command is cheap, so no change
+    // tracking is needed.
+    fn apply_window_level(&self, ctx: &egui::Context) {
+        let level = if self.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+    }
 }
 
 impl eframe::App for VmTyper {
@@ -218,8 +293,29 @@ impl eframe::App for VmTyper {
             (s.status.clone(), s.progress, s.running)
         };
 
+        self.apply_window_level(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Mode-dependent top section
+            if self.compact_mode {
+                // Minimal layout: just the controls someone needs while
+                // the VM window has focus. "Return" undoes the shrink.
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
+                        self.start(ctx);
+                    }
+                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                        self.stop.store(true, Ordering::SeqCst);
+                    }
+                    if ui.button("Return").clicked() {
+                        self.set_compact(ctx, false);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.add(egui::ProgressBar::new(progress));
+                return;
+            }
+
             match self.input_mode {
                 InputMode::Text => {
                     ui.horizontal(|ui| {
@@ -237,97 +333,8 @@ impl eframe::App for VmTyper {
                                 .desired_rows(12),
                         );
                     });
-                }
-                InputMode::FileBrowser => {
+
                     ui.horizontal(|ui| {
-                        ui.label("File Tree & Selector");
-                        if let Some(ref file) = self.selected_file {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let name = file.file_name().unwrap_or_default().to_string_lossy();
-                                ui.label(format!("Selected: {name} ({} chars)", self.text.chars().count()));
-                            });
-                        }
-                    });
-
-                    // Directory navigation bar
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!running, egui::Button::new("📁 Up")).clicked() {
-                            if let Some(parent) = self.current_dir.parent() {
-                                self.current_dir = parent.to_path_buf();
-                            }
-                        }
-                        ui.label(format!("Path: {}", self.current_dir.display()));
-                    });
-
-                    // Scrollable file tree view
-                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                        if let Ok(entries) = std::fs::read_dir(&self.current_dir) {
-                            let mut dirs = vec![];
-                            let mut files = vec![];
-                            for entry in entries.flatten() {
-                                if let Ok(meta) = entry.metadata() {
-                                    let path = entry.path();
-                                    if meta.is_dir() {
-                                        dirs.push(path);
-                                    } else if meta.is_file() {
-                                        let ext = path.extension()
-                                            .and_then(|e| e.to_str())
-                                            .unwrap_or("")
-                                            .to_lowercase();
-                                        let skip_exts =["exe", "dll", "bin", "png", "jpg", "jpeg", "ico", "zip", "tar", "gz", "pdf", "mp3", "mp4", "db"];
-                                        if skip_exts.contains(&ext.as_str()){
-                                            continue;
-                                        }
-                                        if let Ok(content) = std::fs::read_to_string(&path){
-                                            if !content.chars().any(|c| c == '\0'){
-                                                files.push(path);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            dirs.sort();
-                            files.sort();
-
-                            for dir in dirs {
-                                if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-                                    if ui.selectable_label(false, format!("📁 {name}")).clicked() {
-                                        self.current_dir = dir;
-                                    }
-                                }
-                            }
-                            for file in files {
-                                if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
-                                    let is_selected = self.selected_file.as_ref() == Some(&file);
-                                    if ui.selectable_label(is_selected, format!("📄 {name}")).clicked() {
-                                        self.selected_file = Some(file.clone());
-                                        match std::fs::read_to_string(&file) {
-                                            Ok(content) => {
-                                                self.text = content;
-                                                set(&self.shared, |s| {
-                                                    s.status = format!("Loaded file: {name}");
-                                                });
-                                            }
-                                            Err(e) => {
-                                                set(&self.shared, |s| {
-                                                    s.status = format!("Error reading file: {e}");
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            ui.label("Unable to read directory contents.");
-                        }
-                    });
-                }
-            }
-
-            // Controls below text/file area
-            ui.horizontal(|ui| {
-                match self.input_mode {
-                    InputMode::Text => {
                         if ui.add_enabled(!running, egui::Button::new("Paste clipboard")).clicked() {
                             self.paste_clipboard();
                         }
@@ -335,26 +342,90 @@ impl eframe::App for VmTyper {
                             self.text.clear();
                             set(&self.shared, |s| s.progress = 0.0);
                         }
-                    }
-                    InputMode::FileBrowser => {
-                        if ui.add_enabled(!running, egui::Button::new("Clear File Selection")).clicked() {
-                            self.text.clear();
-                            self.selected_file = None;
-                            set(&self.shared, |s| s.progress = 0.0);
+                    });
+                }
+                InputMode::File => {
+                    ui.horizontal(|ui| {
+                        ui.label("Drop a text file below");
+                        if self.dropped_file.is_some() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(format!("{} characters", self.text.chars().count()));
+                            });
+                        }
+                    });
+
+                    // Drop zone: a bordered area that reacts to files being
+                    // dragged over it, and shows a short preview once a
+                    // file is loaded.
+                    let hovering_file = ctx.input(|i| !i.raw.hovered_files.is_empty());
+                    let frame = egui::Frame::group(ui.style())
+                        .fill(if hovering_file {
+                            ui.visuals().widgets.hovered.weak_bg_fill
+                        } else {
+                            ui.visuals().extreme_bg_color
+                        })
+                        .inner_margin(10.0);
+
+                    frame.show(ui, |ui| {
+                        ui.set_min_height(240.0);
+                        ui.set_width(ui.available_width());
+
+                        if let Some(path) = &self.dropped_file {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            ui.strong(format!("Loaded: {name}"));
+                            ui.add_space(4.0);
+                            egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.preview.as_str())
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(10),
+                                );
+                            });
+                        } else {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(80.0);
+                                ui.label("Drag and drop a text file here");
+                                ui.weak("(the file's text will be typed, not re-read at start)");
+                            });
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!running, egui::Button::new("Clear file")).clicked() {
+                            self.clear_file();
+                        }
+                    });
+
+                    // Actually handle a drop that happened this frame.
+                    let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+                    if !running {
+                        if let Some(file) = dropped.into_iter().find_map(|f| f.path) {
+                            self.load_file(file);
                         }
                     }
                 }
+            }
 
-                // Mode toggle button
-                let mode_label = match self.input_mode {
-                    InputMode::Text => "Mode: Text / Clipboard",
-                    InputMode::FileBrowser => "Mode: File Tree",
-                };
-                if ui.add_enabled(!running, egui::Button::new(mode_label)).clicked() {
-                    self.input_mode = match self.input_mode {
-                        InputMode::Text => InputMode::FileBrowser,
-                        InputMode::FileBrowser => InputMode::Text,
-                    };
+            ui.separator();
+
+            // Mode toggle, separate from the Settings group below since it
+            // changes what the main panel shows, not a typing behavior.
+            ui.horizontal(|ui| {
+                ui.label("Input source:");
+                if ui
+                    .selectable_label(matches!(self.input_mode, InputMode::Text), "Text / clipboard")
+                    .clicked()
+                {
+                    self.input_mode = InputMode::Text;
+                }
+                if ui
+                    .selectable_label(matches!(self.input_mode, InputMode::File), "File drop")
+                    .clicked()
+                {
+                    self.input_mode = InputMode::File;
                 }
             });
 
@@ -379,6 +450,15 @@ impl eframe::App for VmTyper {
                 ui.checkbox(&mut self.clean, "Replace smart quotes and dashes with plain ASCII");
                 ui.checkbox(&mut self.strip_indent, "Strip leading indentation (for editors that auto-indent)");
                 ui.checkbox(&mut self.final_enter, "Press Enter when finished");
+                ui.checkbox(&mut self.always_on_top, "Keep window always on top");
+
+                // --- Add more settings here -------------------------------
+                // Simple on/off: ui.checkbox(&mut self.your_field, "Label");
+                // A number: add a row to the Grid above, same pattern as
+                //   "Start delay" / "Per-key delay".
+                // Don't forget to add the matching field to VmTyper's
+                // struct definition and to VmTyper::new()'s initializer.
+                // -----------------------------------------------------------
             });
 
             ui.add_space(8.0);
@@ -388,6 +468,9 @@ impl eframe::App for VmTyper {
                 }
                 if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
                     self.stop.store(true, Ordering::SeqCst);
+                }
+                if ui.button("Shrink").clicked() {
+                    self.set_compact(ctx, true);
                 }
             });
 
@@ -404,9 +487,9 @@ impl eframe::App for VmTyper {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 580.0])
-            .with_min_inner_size([440.0, 480.0])
-            .with_always_on_top(), // stays visible over the VM window
+            .with_inner_size([520.0, 620.0])
+            .with_min_inner_size([440.0, 520.0])
+            .with_always_on_top(), // initial state; toggled at runtime via the Settings checkbox
         ..Default::default()
     };
     eframe::run_native(
