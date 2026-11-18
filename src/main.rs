@@ -15,15 +15,14 @@ use std::time::Duration;
 enum InputMode {
     Text,
     File,
+    File2,
 }
 
-// How much of a dropped file to show as a preview, so a huge file
-// doesn't get rendered into the UI in full.
 const PREVIEW_CHARS: usize = 600;
-
-// Window sizes for the normal and compact layouts.
-const NORMAL_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 620.0);
+const NORMAL_SIZE: egui::Vec2 = egui::Vec2::new(520.0, 680.0);
 const COMPACT_SIZE: egui::Vec2 = egui::Vec2::new(230.0, 95.0);
+const FAST_KEY_MS: u64 = 5;
+const FAST_CHUNK: u64 = 20;
 
 struct Shared {
     status: String,
@@ -31,23 +30,117 @@ struct Shared {
     running: bool,
 }
 
+struct QueuedScript {
+    path: PathBuf,
+    text: String,
+    preview: String,
+}
+
+struct TypeJob {
+    label: String,
+    text: String,
+}
+
+// --- DuckyScript Parser (Dedicated to File2) --------------------------------
+#[derive(Debug, Clone)]
+enum DuckyCommand {
+    String(String),
+    StringLn(String),
+    Delay(u64),
+    Keys(Vec<String>),
+}
+
+fn parse_duckyscript(content: &str) -> Vec<DuckyCommand> {
+    let mut commands = Vec::new();
+    let mut in_rem_block = false;
+
+    for line in content.lines() {
+        let line_trim = line.trim();
+        if line_trim.is_empty() {
+            continue;
+        }
+        if line_trim.starts_with("REM_BLOCK") {
+            in_rem_block = true;
+            continue;
+        }
+        if line_trim.starts_with("END_REM") {
+            in_rem_block = false;
+            continue;
+        }
+        if in_rem_block || line_trim.starts_with("//") || line_trim.starts_with("REM") {
+            continue;
+        }
+
+        if let Some(rest) = line_trim.strip_prefix("STRINGLN ") {
+            commands.push(DuckyCommand::StringLn(rest.to_string()));
+        } else if let Some(rest) = line_trim.strip_prefix("STRING ") {
+            commands.push(DuckyCommand::String(rest.to_string()));
+        } else if let Some(rest) = line_trim.strip_prefix("DELAY ") {
+            if let Ok(ms) = rest.trim().parse::<u64>() {
+                commands.push(DuckyCommand::Delay(ms));
+            }
+        } else {
+            let parts: Vec<String> = line_trim.split_whitespace().map(|s| s.to_uppercase()).collect();
+            if !parts.is_empty() {
+                commands.push(DuckyCommand::Keys(parts));
+            }
+        }
+    }
+    commands
+}
+
+fn map_key_name(name: &str) -> Option<Key> {
+    match name {
+        "ENTER" => Some(Key::Return),
+        "TAB" => Some(Key::Tab),
+        "SPACE" => Some(Key::Space),
+        "BACKSPACE" => Some(Key::Backspace),
+        "ESC" | "ESCAPE" => Some(Key::Escape),
+        "DELETE" => Some(Key::Delete),
+        "CTRL" | "RCTRL" => Some(Key::Control),
+        "SHIFT" | "RSHIFT" => Some(Key::Shift),
+        "ALT" | "RALT" => Some(Key::Alt),
+        "WINDOWS" | "RWINDOWS" | "GUI" | "COMMAND" | "RCOMMAND" => Some(Key::Meta),
+        other => {
+            if other.chars().count() == 1 {
+                let c = other.chars().next()?.to_ascii_uppercase();
+                match c {
+                    'A' => Some(Key::A), 'B' => Some(Key::B), 'C' => Some(Key::C),
+                    'D' => Some(Key::D), 'E' => Some(Key::E), 'F' => Some(Key::F),
+                    'G' => Some(Key::G), 'H' => Some(Key::H), 'I' => Some(Key::I),
+                    'J' => Some(Key::J), 'K' => Some(Key::K), 'L' => Some(Key::L),
+                    'M' => Some(Key::M), 'N' => Some(Key::N), 'O' => Some(Key::O),
+                    'P' => Some(Key::P), 'Q' => Some(Key::Q), 'R' => Some(Key::R),
+                    'S' => Some(Key::S), 'T' => Some(Key::T), 'U' => Some(Key::U),
+                    'V' => Some(Key::V), 'W' => Some(Key::W), 'X' => Some(Key::X),
+                    'Y' => Some(Key::Y), 'Z' => Some(Key::Z),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+
 struct VmTyper {
     text: String,
     input_mode: InputMode,
-    dropped_file: Option<PathBuf>,
-    preview: String,
+    file_queue: Vec<QueuedScript>,
+    preview_idx: Option<usize>,
+    file_queue_b: Vec<QueuedScript>,
+    preview_idx_b: Option<usize>,
 
-    // --- Settings -------------------------------------------------------
-    // Add new settings fields here as you add more toggles below.
     delay_s: u64,
     key_ms: u64,
+    chunk_size: u64,
+    queue_pause_s: u64,
     clean: bool,
     strip_indent: bool,
+    paste_safe: bool,
     final_enter: bool,
     always_on_top: bool,
-
-    // Whether the window is shrunk to just Start/Stop/Return + progress,
-    // so the full editor doesn't sit on top of the VM window.
     compact_mode: bool,
 
     shared: Arc<Mutex<Shared>>,
@@ -71,7 +164,36 @@ fn set(shared: &Arc<Mutex<Shared>>, f: impl FnOnce(&mut Shared)) {
     f(&mut shared.lock().unwrap());
 }
 
-// Mouse in any screen corner = abort (like pyautogui.FAILSAFE).
+fn type_ducky_char(enigo: &mut Enigo, ch: char) {
+    // One key at a time. Do not tap Alt, Ctrl, or Win — a bare Alt key-up
+    // opens Notepad's menu and the following letters jump around the window.
+    // Only Shift is released, because enigo leaves it down after '!'.
+    let _ = enigo.text(&ch.to_string());
+    let _ = enigo.key(Key::Unicode(ch), Direction::Release);
+    let _ = enigo.key(Key::Shift, Direction::Release);
+    thread::sleep(Duration::from_millis(15));
+}
+
+fn type_ducky_string(enigo: &mut Enigo, s: &str, stop: &AtomicBool) -> bool {
+    for ch in s.chars() {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        match ch {
+            '\n' | '\r' => {
+                let _ = enigo.key(Key::Return, Direction::Click);
+                thread::sleep(Duration::from_millis(15));
+            }
+            '\t' => {
+                let _ = enigo.key(Key::Tab, Direction::Click);
+                thread::sleep(Duration::from_millis(15));
+            }
+            _ => type_ducky_char(enigo, ch),
+        }
+    }
+    true
+}
+
 fn in_corner(enigo: &Enigo) -> bool {
     match (enigo.main_display(), enigo.location()) {
         (Ok((w, h)), Ok((x, y))) => (x <= 0 || x >= w - 1) && (y <= 0 || y >= h - 1),
@@ -84,14 +206,16 @@ fn make_preview(text: &str) -> String {
         text.to_string()
     } else {
         let truncated: String = text.chars().take(PREVIEW_CHARS).collect();
-        format!("{truncated}\n\n… (preview truncated, full text will still be typed)")
+        format!("{truncated}\n\n… (preview truncated)")
     }
 }
 
-fn run(
-    text: String,
+fn run_queue(
+    jobs: Vec<TypeJob>,
     delay: u64,
     interval: Duration,
+    chunk_size: u64,
+    queue_pause: Duration,
     final_enter: bool,
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
@@ -105,7 +229,6 @@ fn run(
         ctx.request_repaint();
     };
 
-    // Enigo is created on this thread (it isn't Send on every platform).
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
         Err(e) => return finish(format!("Could not init input simulation: {e}")),
@@ -124,53 +247,143 @@ fn run(
         }
     }
 
-    let chars: Vec<char> = text.chars().collect();
-    let total = chars.len();
-    let mut skipped = std::collections::BTreeSet::new();
+    let total_jobs = jobs.len();
+    for (idx, job) in jobs.iter().enumerate() {
+        let chars: Vec<char> = job.text.chars().collect();
+        let _total = chars.len();
+        let mut buf = String::new();
 
-    for (i, ch) in chars.iter().enumerate() {
-        let idx = i + 1;
-        if stop.load(Ordering::SeqCst) {
-            return finish(format!("Stopped at {i} of {total} characters."));
-        }
-        if in_corner(&enigo) {
-            return finish("Aborted by fail-safe (mouse hit a screen corner).".into());
-        }
-
-        let res = match ch {
-            '\n' => enigo.key(Key::Return, Direction::Click),
-            '\t' => enigo.key(Key::Tab, Direction::Click),
-            c if !c.is_ascii() => {
-                skipped.insert(*c);
-                Ok(())
+        for (_i, &ch) in chars.iter().enumerate() {
+            if stop.load(Ordering::SeqCst) {
+                return finish("Stopped.".into());
             }
-            c => enigo.text(&c.to_string()),
-        };
-        if let Err(e) = res {
-            return finish(format!("Input error at character {idx}: {e}"));
+            if ch == '\n' {
+                if !buf.is_empty() {
+                    let _ = enigo.text(&buf);
+                    buf.clear();
+                }
+                let _ = enigo.key(Key::Return, Direction::Click);
+            } else {
+                buf.push(ch);
+                if buf.chars().count() >= chunk_size as usize {
+                    let _ = enigo.text(&buf);
+                    buf.clear();
+                }
+            }
+            if !interval.is_zero() {
+                thread::sleep(interval);
+            }
+        }
+        if !buf.is_empty() {
+            let _ = enigo.text(&buf);
         }
 
-        if !interval.is_zero() {
-            thread::sleep(interval);
-        }
-        if idx % 10 == 0 || idx == total {
-            set(&shared, |s| {
-                s.progress = idx as f32 / total as f32;
-                s.status = format!("Typing... {idx} / {total}");
-            });
-            ctx.request_repaint();
+        let is_last = idx + 1 == total_jobs;
+        if !is_last && !queue_pause.is_zero() {
+            thread::sleep(queue_pause);
         }
     }
 
     if final_enter {
         let _ = enigo.key(Key::Return, Direction::Click);
     }
-    let mut msg = String::from("Done.");
-    if !skipped.is_empty() {
-        let list: String = skipped.into_iter().collect();
-        msg.push_str(&format!(" Skipped non-ASCII characters: {list}"));
+    finish("Done.".to_string())
+}
+
+fn run_duckyscript_queue(
+    scripts: Vec<(String, String)>,
+    delay: u64,
+    queue_pause: Duration,
+    shared: Arc<Mutex<Shared>>,
+    stop: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    let finish = |msg: String| {
+        set(&shared, |s| {
+            s.status = msg;
+            s.running = false;
+        });
+        ctx.request_repaint();
+    };
+
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(e) => e,
+        Err(e) => return finish(format!("Could not init input simulation: {e}")),
+    };
+
+    for i in (1..=delay).rev() {
+        set(&shared, |s| {
+            s.status = format!("Click inside the VM console. DuckyScript starts in {i}s...")
+        });
+        ctx.request_repaint();
+        for _ in 0..10 {
+            if stop.load(Ordering::SeqCst) {
+                return finish("Stopped before execution started.".into());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
-    finish(msg);
+
+    let total_scripts = scripts.len();
+
+    for (idx, (label, content)) in scripts.into_iter().enumerate() {
+        let commands = parse_duckyscript(&content);
+        let cmd_total = commands.len();
+
+        for (c_idx, cmd) in commands.into_iter().enumerate() {
+            if stop.load(Ordering::SeqCst) {
+                return finish(format!("Stopped at script '{label}'."));
+            }
+            if in_corner(&enigo) {
+                return finish("Aborted by fail-safe.".into());
+            }
+
+            match cmd {
+                DuckyCommand::String(s) => {
+                    if !type_ducky_string(&mut enigo, &s, &stop) {
+                        return finish(format!("Stopped at script '{label}'."));
+                    }
+                }
+                DuckyCommand::StringLn(s) => {
+                    if !type_ducky_string(&mut enigo, &s, &stop) {
+                        return finish(format!("Stopped at script '{label}'."));
+                    }
+                    let _ = enigo.key(Key::Return, Direction::Click);
+                }
+                DuckyCommand::Delay(ms) => {
+                    thread::sleep(Duration::from_millis(ms));
+                }
+                DuckyCommand::Keys(keys) => {
+                    let mut mapped_keys = Vec::new();
+                    for k in &keys {
+                        if let Some(vk) = map_key_name(k) {
+                            mapped_keys.push(vk);
+                        }
+                    }
+                    for &vk in &mapped_keys {
+                        let _ = enigo.key(vk, Direction::Press);
+                    }
+                    thread::sleep(Duration::from_millis(40));
+                    for &vk in mapped_keys.iter().rev() {
+                        let _ = enigo.key(vk, Direction::Release);
+                    }
+                }
+            }
+
+            set(&shared, |s| {
+                s.progress = (c_idx + 1) as f32 / cmd_total.max(1) as f32;
+                s.status = format!("[{}/{}] {label}: command {} / {cmd_total}", idx + 1, total_scripts, c_idx + 1);
+            });
+            ctx.request_repaint();
+        }
+
+        let is_last = idx + 1 == total_scripts;
+        if !is_last && !queue_pause.is_zero() {
+            thread::sleep(queue_pause);
+        }
+    }
+
+    finish("DuckyScript execution complete.".into());
 }
 
 impl VmTyper {
@@ -178,17 +391,22 @@ impl VmTyper {
         Self {
             text: String::new(),
             input_mode: InputMode::Text,
-            dropped_file: None,
-            preview: String::new(),
+            file_queue: Vec::new(),
+            preview_idx: None,
+            file_queue_b: Vec::new(),
+            preview_idx_b: None,
             delay_s: 5,
             key_ms: 40,
+            chunk_size: 1,
+            queue_pause_s: 2,
             clean: true,
             strip_indent: false,
+            paste_safe: false,
             final_enter: false,
             always_on_top: true,
             compact_mode: false,
             shared: Arc::new(Mutex::new(Shared {
-                status: "Paste text, or switch to File mode and drop a file in.".into(),
+                status: "Paste text, or switch to File mode and drop scripts in.".into(),
                 progress: 0.0,
                 running: false,
             })),
@@ -202,34 +420,48 @@ impl VmTyper {
         }
     }
 
-    // Reads a dropped file's contents into self.text and builds the preview.
-    fn load_file(&mut self, path: PathBuf) {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                self.preview = make_preview(&content);
-                self.text = content;
-                self.dropped_file = Some(path);
-                set(&self.shared, |s| s.status = format!("Loaded file: {name}"));
-            }
-            Err(e) => {
-                set(&self.shared, |s| s.status = format!("Could not read file: {e}"));
-            }
+    fn queue_file(&mut self, path: PathBuf) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let preview = make_preview(&content);
+            self.file_queue.push(QueuedScript { path, text: content, preview });
+            self.preview_idx = Some(self.file_queue.len() - 1);
+            set(&self.shared, |s| s.status = format!("Queued: {name}"));
         }
     }
 
-    fn clear_file(&mut self) {
-        self.text.clear();
-        self.preview.clear();
-        self.dropped_file = None;
-        set(&self.shared, |s| s.progress = 0.0);
+    fn remove_from_queue(&mut self, idx: usize) {
+        if idx < self.file_queue.len() { self.file_queue.remove(idx); }
+        self.preview_idx = None;
     }
 
-    fn prepare(&self) -> String {
-        let mut t = self.text.replace("\r\n", "\n").replace('\r', "\n");
+    fn clear_queue(&mut self) {
+        self.file_queue.clear();
+        self.preview_idx = None;
+    }
+
+    fn queue_file_b(&mut self, path: PathBuf) {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            let preview = make_preview(&content);
+            self.file_queue_b.push(QueuedScript { path, text: content, preview });
+            self.preview_idx_b = Some(self.file_queue_b.len() - 1);
+            set(&self.shared, |s| s.status = format!("Queued (B): {name}"));
+        }
+    }
+
+    fn remove_from_queue_b(&mut self, idx: usize) {
+        if idx < self.file_queue_b.len() { self.file_queue_b.remove(idx); }
+        self.preview_idx_b = None;
+    }
+
+    fn clear_queue_b(&mut self) {
+        self.file_queue_b.clear();
+        self.preview_idx_b = None;
+    }
+
+    fn prepare_text(&self, raw: &str) -> String {
+        let mut t = raw.replace("\r\n", "\n").replace('\r', "\n");
         if self.clean {
             t = clean_smart(&t);
         }
@@ -240,48 +472,62 @@ impl VmTyper {
                 .collect::<Vec<_>>()
                 .join("\n");
         }
+        if self.paste_safe {
+            t = t
+                .chars()
+                .filter(|&c| c == '\n' || c == '\t' || c == ' ' || c.is_ascii_graphic())
+                .collect();
+        }
         t
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let text = self.prepare();
-        if text.trim().is_empty() {
-            set(&self.shared, |s| s.status = "Nothing to type. Paste some text first.".into());
-            return;
+        let delay_s = self.delay_s;
+        let key_ms = self.key_ms;
+        let chunk_size = self.chunk_size;
+        let queue_pause_s = self.queue_pause_s;
+        let final_enter = self.final_enter;
+
+        match self.input_mode {
+            InputMode::Text => {
+                let text = self.prepare_text(&self.text);
+                let jobs = vec![TypeJob { label: "Text".into(), text }];
+                self.stop.store(false, Ordering::SeqCst);
+                set(&self.shared, |s| { s.running = true; s.progress = 0.0; });
+                let (shared, stop, ctx) = (self.shared.clone(), self.stop.clone(), ctx.clone());
+                thread::spawn(move || run_queue(jobs, delay_s, Duration::from_millis(key_ms), chunk_size, Duration::ZERO, final_enter, shared, stop, ctx));
+            }
+            InputMode::File => {
+                let jobs = self.file_queue.iter().map(|q| TypeJob { label: q.path.file_name().unwrap_or_default().to_string_lossy().into(), text: self.prepare_text(&q.text) }).collect();
+                self.stop.store(false, Ordering::SeqCst);
+                set(&self.shared, |s| { s.running = true; s.progress = 0.0; });
+                let (shared, stop, ctx) = (self.shared.clone(), self.stop.clone(), ctx.clone());
+                thread::spawn(move || run_queue(jobs, delay_s, Duration::from_millis(key_ms), chunk_size, Duration::from_secs(queue_pause_s), final_enter, shared, stop, ctx));
+            }
+            InputMode::File2 => {
+                let scripts = self.file_queue_b.iter().map(|q| (q.path.file_name().unwrap_or_default().to_string_lossy().into(), q.text.clone())).collect();
+                self.stop.store(false, Ordering::SeqCst);
+                set(&self.shared, |s| { s.running = true; s.progress = 0.0; });
+                let (shared, stop, ctx) = (self.shared.clone(), self.stop.clone(), ctx.clone());
+                thread::spawn(move || run_duckyscript_queue(scripts, delay_s, Duration::from_secs(queue_pause_s), shared, stop, ctx));
+            }
         }
-        self.stop.store(false, Ordering::SeqCst);
-        set(&self.shared, |s| {
-            s.running = true;
-            s.progress = 0.0;
-        });
-        let (shared, stop, ctx) = (self.shared.clone(), self.stop.clone(), ctx.clone());
-        let (delay, interval, fin) = (
-            self.delay_s.max(1),
-            Duration::from_millis(self.key_ms),
-            self.final_enter,
-        );
-        thread::spawn(move || run(text, delay, interval, fin, shared, stop, ctx));
     }
 
-    // Shrinks or restores the window and flips compact_mode.
+    fn apply_fast_preset(&mut self) {
+        self.key_ms = FAST_KEY_MS;
+        self.chunk_size = FAST_CHUNK;
+    }
+
     fn set_compact(&mut self, ctx: &egui::Context, compact: bool) {
         self.compact_mode = compact;
         let size = if compact { COMPACT_SIZE } else { NORMAL_SIZE };
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-        // Compact mode has a fixed small size; let the normal layout be
-        // resized freely again once we return to it.
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!compact));
     }
 
-    // Applies the always-on-top setting to the actual OS window.
-    // Called once per frame; sending the command is cheap, so no change
-    // tracking is needed.
     fn apply_window_level(&self, ctx: &egui::Context) {
-        let level = if self.always_on_top {
-            egui::WindowLevel::AlwaysOnTop
-        } else {
-            egui::WindowLevel::Normal
-        };
+        let level = if self.always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
     }
 }
@@ -292,204 +538,158 @@ impl eframe::App for VmTyper {
             let s = self.shared.lock().unwrap();
             (s.status.clone(), s.progress, s.running)
         };
-
         self.apply_window_level(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.compact_mode {
-                // Minimal layout: just the controls someone needs while
-                // the VM window has focus. "Return" undoes the shrink.
-                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
-                        self.start(ctx);
-                    }
-                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
-                        self.stop.store(true, Ordering::SeqCst);
-                    }
-                    if ui.button("Return").clicked() {
-                        self.set_compact(ctx, false);
-                    }
+                    if ui.add_enabled(!running, egui::Button::new("Start")).clicked() { self.start(ctx); }
+                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() { self.stop.store(true, Ordering::SeqCst); }
+                    if ui.button("Return").clicked() { self.set_compact(ctx, false); }
                 });
-                ui.add_space(6.0);
-                ui.add(egui::ProgressBar::new(progress));
+                ui.add(egui::ProgressBar::new(progress).show_percentage());
+                ui.label(&status);
                 return;
             }
+
+            ui.horizontal(|ui| {
+                ui.label("Mode:");
+                ui.selectable_value(&mut self.input_mode, InputMode::Text, "Text");
+                ui.selectable_value(&mut self.input_mode, InputMode::File, "File queue");
+                ui.selectable_value(&mut self.input_mode, InputMode::File2, "DuckyScript");
+            });
+            ui.separator();
 
             match self.input_mode {
                 InputMode::Text => {
                     ui.horizontal(|ui| {
-                        ui.label("Text to type");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("{} characters", self.text.chars().count()));
-                        });
-                    });
-
-                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        ui.add_enabled(
-                            !running,
-                            egui::TextEdit::multiline(&mut self.text)
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(12),
-                        );
-                    });
-
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!running, egui::Button::new("Paste clipboard")).clicked() {
+                        if ui.button("Paste clipboard").clicked() {
                             self.paste_clipboard();
                         }
-                        if ui.add_enabled(!running, egui::Button::new("Clear")).clicked() {
+                        if ui.button("Clear").clicked() {
                             self.text.clear();
-                            set(&self.shared, |s| s.progress = 0.0);
                         }
                     });
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.text)
+                            .desired_rows(12)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Text to type into the VM console…"),
+                    );
                 }
                 InputMode::File => {
-                    ui.horizontal(|ui| {
-                        ui.label("Drop a text file below");
-                        if self.dropped_file.is_some() {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(format!("{} characters", self.text.chars().count()));
+                    ui.label("Drop text files onto this window to queue them.");
+                    let dropped: Vec<PathBuf> = ctx.input(|i| {
+                        i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+                    });
+                    for path in dropped {
+                        self.queue_file(path);
+                    }
+                    if ui.button("Clear queue").clicked() {
+                        self.clear_queue();
+                    }
+                    let mut remove = None;
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        for (idx, q) in self.file_queue.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let name = q.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "(unnamed)".into());
+                                if ui.selectable_label(self.preview_idx == Some(idx), name).clicked() {
+                                    self.preview_idx = Some(idx);
+                                }
+                                if ui.small_button("x").clicked() {
+                                    remove = Some(idx);
+                                }
                             });
                         }
                     });
-
-                    // Drop zone: a bordered area that reacts to files being
-                    // dragged over it, and shows a short preview once a
-                    // file is loaded.
-                    let hovering_file = ctx.input(|i| !i.raw.hovered_files.is_empty());
-                    let frame = egui::Frame::group(ui.style())
-                        .fill(if hovering_file {
-                            ui.visuals().widgets.hovered.weak_bg_fill
-                        } else {
-                            ui.visuals().extreme_bg_color
-                        })
-                        .inner_margin(10.0);
-
-                    frame.show(ui, |ui| {
-                        ui.set_min_height(240.0);
-                        ui.set_width(ui.available_width());
-
-                        if let Some(path) = &self.dropped_file {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string());
-                            ui.strong(format!("Loaded: {name}"));
-                            ui.add_space(4.0);
-                            egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut self.preview.as_str())
-                                        .desired_width(f32::INFINITY)
-                                        .desired_rows(10),
-                                );
-                            });
-                        } else {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(80.0);
-                                ui.label("Drag and drop a text file here");
-                                ui.weak("(the file's text will be typed, not re-read at start)");
+                    if let Some(idx) = remove {
+                        self.remove_from_queue(idx);
+                    }
+                }
+                InputMode::File2 => {
+                    ui.label("Drop DuckyScript files. Typed one key at a time (chunk size ignored).");
+                    let dropped: Vec<PathBuf> = ctx.input(|i| {
+                        i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+                    });
+                    for path in dropped {
+                        self.queue_file_b(path);
+                    }
+                    if ui.button("Clear queue").clicked() {
+                        self.clear_queue_b();
+                    }
+                    let mut remove = None;
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        for (idx, q) in self.file_queue_b.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let name = q.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "(unnamed)".into());
+                                if ui.selectable_label(self.preview_idx_b == Some(idx), name).clicked() {
+                                    self.preview_idx_b = Some(idx);
+                                }
+                                if ui.small_button("x").clicked() {
+                                    remove = Some(idx);
+                                }
                             });
                         }
                     });
-
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!running, egui::Button::new("Clear file")).clicked() {
-                            self.clear_file();
-                        }
-                    });
-
-                    // Actually handle a drop that happened this frame.
-                    let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-                    if !running {
-                        if let Some(file) = dropped.into_iter().find_map(|f| f.path) {
-                            self.load_file(file);
-                        }
+                    if let Some(idx) = remove {
+                        self.remove_from_queue_b(idx);
                     }
                 }
             }
 
             ui.separator();
-
-            // Mode toggle, separate from the Settings group below since it
-            // changes what the main panel shows, not a typing behavior.
-            ui.horizontal(|ui| {
-                ui.label("Input source:");
-                if ui
-                    .selectable_label(matches!(self.input_mode, InputMode::Text), "Text / clipboard")
-                    .clicked()
-                {
-                    self.input_mode = InputMode::Text;
+            egui::CollapsingHeader::new("Settings").default_open(true).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Start delay (s)");
+                    ui.add(egui::DragValue::new(&mut self.delay_s).range(0..=60));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Key interval (ms)");
+                    ui.add(egui::DragValue::new(&mut self.key_ms).range(0..=500));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Chunk size (Text/File only)");
+                    ui.add(egui::DragValue::new(&mut self.chunk_size).range(1..=200));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pause between files (s)");
+                    ui.add(egui::DragValue::new(&mut self.queue_pause_s).range(0..=120));
+                });
+                if ui.button("Fast preset").clicked() {
+                    self.apply_fast_preset();
                 }
-                if ui
-                    .selectable_label(matches!(self.input_mode, InputMode::File), "File drop")
-                    .clicked()
-                {
-                    self.input_mode = InputMode::File;
+                ui.checkbox(&mut self.clean, "Clean smart quotes");
+                ui.checkbox(&mut self.strip_indent, "Strip leading indent");
+                ui.checkbox(&mut self.paste_safe, "ASCII paste-safe only");
+                ui.checkbox(&mut self.final_enter, "Press Enter at the end");
+                if ui.checkbox(&mut self.always_on_top, "Always on top").changed() {
+                    self.apply_window_level(ctx);
                 }
             });
 
             ui.separator();
-            ui.group(|ui| {
-                ui.set_width(ui.available_width()); // fill the window width
-                ui.strong("Settings");
-                ui.add_space(4.0);
-
-                egui::Grid::new("settings_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 6.0]) // [horizontal, vertical] gap
-                    .show(ui, |ui| {
-                        ui.label("Start delay (s)");
-                        ui.add_sized([70.0, 20.0], egui::DragValue::new(&mut self.delay_s).range(1..=60));
-                        ui.end_row();
-                        ui.label("Per-key delay (ms)");
-                        ui.add_sized([70.0, 20.0], egui::DragValue::new(&mut self.key_ms).range(0..=500).speed(5));
-                        ui.end_row();
-                    });
-                ui.add_space(4.0);
-                ui.checkbox(&mut self.clean, "Replace smart quotes and dashes with plain ASCII");
-                ui.checkbox(&mut self.strip_indent, "Strip leading indentation (for editors that auto-indent)");
-                ui.checkbox(&mut self.final_enter, "Press Enter when finished");
-                ui.checkbox(&mut self.always_on_top, "Keep window always on top");
-
-                // --- Add more settings here -------------------------------
-                // Simple on/off: ui.checkbox(&mut self.your_field, "Label");
-                // A number: add a row to the Grid above, same pattern as
-                //   "Start delay" / "Per-key delay".
-                // Don't forget to add the matching field to VmTyper's
-                // struct definition and to VmTyper::new()'s initializer.
-                // -----------------------------------------------------------
-            });
-
-            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!running, egui::Button::new("Start typing")).clicked() {
+                if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
                     self.start(ctx);
                 }
                 if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
                     self.stop.store(true, Ordering::SeqCst);
                 }
-                if ui.button("Shrink").clicked() {
+                if ui.button("Compact").clicked() {
                     self.set_compact(ctx, true);
                 }
             });
-
-            ui.add(egui::ProgressBar::new(progress));
-            ui.label(status);
+            ui.add(egui::ProgressBar::new(progress).show_percentage());
+            ui.label(&status);
         });
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 620.0])
-            .with_min_inner_size([440.0, 520.0])
-            .with_always_on_top(), // initial state; toggled at runtime via the Settings checkbox
+            .with_inner_size(NORMAL_SIZE)
+            .with_always_on_top(),
         ..Default::default()
     };
     eframe::run_native(
